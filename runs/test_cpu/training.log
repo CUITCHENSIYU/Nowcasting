@@ -1,0 +1,2 @@
+[2026-07-12 04:56:44,684 metnet_trainer.py:229] Start training: world_size=1, batch_size=1, forecast_steps_train=4
+[2026-07-12 04:57:10,757 metnet_trainer.py:229] Start training: world_size=1, batch_size=1, forecast_steps_train=4

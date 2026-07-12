@@ -1,0 +1,48 @@
+config_dir: ./configs
+criterion:
+  loss_type: cross_entropy
+  type: MetNetLoss
+dataset:
+  bin_size: 0.2
+  forecast_steps: 96
+  input_size: 256
+  num_bins: 512
+  seq_len: 16
+  train:
+    length: 256
+  type: SyntheticNowcastDataset
+  val:
+    length: 32
+local_rank: 0
+model:
+  forecast_steps: 96
+  hidden_dim: 1024
+  input_channels: 1
+  input_size: 64
+  low_mem: true
+  num_att_heads: 16
+  num_att_layers: 2
+  num_layers: 1
+  output_channels: 512
+  type: MetNet
+runner:
+  batch_size: 1
+  enable_amp: true
+  find_unused_parameters: false
+  forecast_steps_train: 4
+  forecast_steps_val: 4
+  log_interval: 5
+  max_epochs: 2
+  num_workers: 4
+  optimizer:
+    lr: 0.0001
+    params: {}
+    type: AdamW
+    weight_decay: 0.01
+  pretrained_weight_path: null
+  resume: false
+  type: MetNetTrainer
+  val_interval: 1
+task: rainfall_forecast
+workspace: ./runs/test_cpu
+world_size: 1

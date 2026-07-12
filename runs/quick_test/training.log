@@ -1,0 +1,3 @@
+[2026-07-12 05:04:25,553 metnet_trainer.py:229] Start training: world_size=1, batch_size=1, forecast_steps_train=2
+[2026-07-12 05:09:17,518 metnet_trainer.py:185] Epoch [1/1] Iter [1/128] loss=6.2668 time=292.0s
+[2026-07-12 05:14:08,568 metnet_trainer.py:185] Epoch [1/1] Iter [2/128] loss=5.4660 time=583.0s
