@@ -1,6 +1,6 @@
 import os
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -15,12 +15,62 @@ from utils.misc import is_distributed, is_main_process
 from utils.registry import register_module
 
 
+def _rain_weight(x: torch.Tensor, clip: float = 24.0) -> torch.Tensor:
+    """Pixel weight w(x) = min(clip, 1 + x) from NowcastNet / DGMR."""
+    return torch.clamp(1.0 + x, max=clip)
+
+
+def weighted_l1(
+    pred: torch.Tensor, target: torch.Tensor, weight_clip: float = 24.0
+) -> torch.Tensor:
+    """L_wdis(x, x') = ||(x - x') ⊙ w(x)||_1 (mean-reduced)."""
+    weight = _rain_weight(target, clip=weight_clip)
+    return ((pred - target).abs() * weight).mean()
+
+
+def motion_regularization(
+    motion: torch.Tensor,
+    target: torch.Tensor,
+    weight_clip: float = 24.0,
+) -> torch.Tensor:
+    """J_motion: Sobel gradient norm of motion fields, weighted by w(x).
+
+    motion: [B, T, 2, H, W], target: [B, T, H, W, 1] or [B, T, H, W]
+    """
+    if target.dim() == 5:
+        target = target.squeeze(-1)
+    weight = _rain_weight(target, clip=weight_clip)  # [B, T, H, W]
+
+    # Sobel kernels (eq. 7): ∂x ≈ [[1,0,-1],[2,0,-2],[1,0,-1]], ∂y ≈ [[1,2,1],[0,0,0],[-1,-2,-1]]
+    sobel_x = motion.new_tensor(
+        [[1.0, 0.0, -1.0], [2.0, 0.0, -2.0], [1.0, 0.0, -1.0]]
+    ).view(1, 1, 3, 3)
+    sobel_y = motion.new_tensor(
+        [[1.0, 2.0, 1.0], [0.0, 0.0, 0.0], [-1.0, -2.0, -1.0]]
+    ).view(1, 1, 3, 3)
+
+    batch, steps, _, height, width = motion.shape
+    # [B*T*2, 1, H, W] for depthwise-style sobel on each component
+    motion_flat = motion.reshape(batch * steps * 2, 1, height, width)
+    dx = F.conv2d(motion_flat, sobel_x, padding=1)
+    dy = F.conv2d(motion_flat, sobel_y, padding=1)
+    grad_sq = (dx.pow(2) + dy.pow(2)).view(batch, steps, 2, height, width)
+
+    # 1/2 * sum_c ||∇v^c ⊙ w||_2^2  → mean over elements for scale stability
+    w2 = weight.unsqueeze(2).pow(2)  # [B, T, 1, H, W]
+    return 0.5 * (grad_sq * w2).mean()
+
+
 @register_module(parent="runners")
 class SkillfullTrainer:
-    """Supervised trainer for Skillful Nowcasting (generator + evolution MSE).
+    """Supervised trainer for Skillful Nowcasting.
 
-    Full adversarial (GAN) training is not included yet; this matches the
-    PredRNN-style single-optimizer loop for getting a runnable baseline.
+    Evolution loss follows NowcastNet:
+      J_accum = L_wdis(x, x'_bili) + L_wdis(x, x'')
+      J_motion = Sobel gradient regularization on motion fields
+      J_evolution = J_accum + λ J_motion
+
+    Generator uses MSE (adversarial training not included yet).
     """
 
     def __init__(
@@ -41,7 +91,9 @@ class SkillfullTrainer:
         find_unused_parameters: bool = False,
         optimizer: Optional[dict] = None,
         scheduler: Optional[dict] = None,
-        evo_loss_weight: float = 0.5,
+        evo_loss_weight: float = 1.0,
+        motion_reg_weight: float = 1e-2,
+        rain_weight_clip: float = 24.0,
         log_file: str = "training.log",
         local_rank: int = 0,
         world_size: int = 1,
@@ -70,6 +122,8 @@ class SkillfullTrainer:
         self.log_interval = log_interval
         self.with_mask = with_mask
         self.evo_loss_weight = float(evo_loss_weight)
+        self.motion_reg_weight = float(motion_reg_weight)
+        self.rain_weight_clip = float(rain_weight_clip)
         self.global_step = 0
         self.epoch = 0
 
@@ -159,13 +213,35 @@ class SkillfullTrainer:
             return sq_err.mean()
         return sq_err.masked_select(mask).mean()
 
+    def _evolution_loss(
+        self,
+        evo_pred: torch.Tensor,
+        evo_bili: torch.Tensor,
+        motion: torch.Tensor,
+        target: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """NowcastNet J_evolution = J_accum + λ J_motion."""
+        clip = self.rain_weight_clip
+        accum = weighted_l1(evo_bili, target, clip) + weighted_l1(evo_pred, target, clip)
+        motion_reg = motion_regularization(motion, target, clip)
+        evo_loss = accum + self.motion_reg_weight * motion_reg
+        return evo_loss, accum, motion_reg
+
     def _compute_loss(self, frames: torch.Tensor, with_mask: bool = False):
-        gen_pred, evo_pred = self.model(frames)
+        gen_pred, evo_pred, evo_bili, motion = self.model(frames)
         target = frames[:, self.seq_len : self.seq_len + self.forecast_steps]
         gen_loss = self._mse_loss(gen_pred, target, with_mask)
-        evo_loss = self._mse_loss(evo_pred, target, with_mask)
+        evo_loss, accum, motion_reg = self._evolution_loss(
+            evo_pred, evo_bili, motion, target
+        )
         loss = gen_loss + self.evo_loss_weight * evo_loss
-        return loss, float(gen_loss.detach()), float(evo_loss.detach())
+        return (
+            loss,
+            float(gen_loss.detach()),
+            float(evo_loss.detach()),
+            float(accum.detach()),
+            float(motion_reg.detach()),
+        )
 
     def train_epoch(self, epoch: int):
         self.model.train()
@@ -179,7 +255,9 @@ class SkillfullTrainer:
             self.optimizer.zero_grad(set_to_none=True)
 
             with torch.cuda.amp.autocast(enabled=self.enable_amp):
-                loss, gen_loss, evo_loss = self._compute_loss(frames, self.with_mask)
+                loss, gen_loss, evo_loss, accum, motion_reg = self._compute_loss(
+                    frames, self.with_mask
+                )
 
             if not torch.isfinite(loss):
                 raise RuntimeError(f"non-finite loss: {loss.item()}")
@@ -204,12 +282,17 @@ class SkillfullTrainer:
                         f"Epoch [{epoch + 1}/{self.max_epochs}] "
                         f"Iter [{batch_idx + 1}/{len(self.train_dataloader)}] "
                         f"loss={loss_val:.6f} gen={gen_loss:.6f} evo={evo_loss:.6f} "
+                        f"accum={accum:.6f} motion={motion_reg:.6f} "
                         f"time={elapsed:.1f}s"
                     )
                 if self.tensorboard:
                     self.tensorboard.add_scalar("train/loss", loss_val, self.global_step)
                     self.tensorboard.add_scalar("train/gen_loss", gen_loss, self.global_step)
                     self.tensorboard.add_scalar("train/evo_loss", evo_loss, self.global_step)
+                    self.tensorboard.add_scalar("train/evo_accum", accum, self.global_step)
+                    self.tensorboard.add_scalar(
+                        "train/evo_motion_reg", motion_reg, self.global_step
+                    )
 
             del loss
 
@@ -227,7 +310,7 @@ class SkillfullTrainer:
         for batch in self.val_dataloader:
             frames = batch["frames"].to(self.device, non_blocking=True)
             with torch.cuda.amp.autocast(enabled=self.enable_amp):
-                loss, _, _ = self._compute_loss(frames, self.with_mask)
+                loss, *_ = self._compute_loss(frames, self.with_mask)
             total_loss += float(loss.item())
             num_batches += 1
 
@@ -246,7 +329,9 @@ class SkillfullTrainer:
             self.logger.info(
                 f"Start Skillful Nowcasting training: world_size={self.world_size}, "
                 f"batch_size={self.batch_size}, total_length={self.total_length}, "
-                f"evo_loss_weight={self.evo_loss_weight}"
+                f"evo_loss_weight={self.evo_loss_weight}, "
+                f"motion_reg_weight={self.motion_reg_weight}, "
+                f"rain_weight_clip={self.rain_weight_clip}"
             )
 
         for epoch in range(self.epoch, self.max_epochs):

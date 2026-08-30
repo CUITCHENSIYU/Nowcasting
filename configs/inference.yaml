@@ -1,6 +1,6 @@
-model_path: /mnt/gpuserver-1-disk0-nfs/chensiyu/github/Nowcasting/runs/2026-08-23-skillfull-nowcast-seq12-out6-size256-time2-space3/latest.pth
-infer_file: /mnt/share-gpuserver-0-disk2-nfs/datasets/depth_estimation_S/data_mining/seq_12_out-seq_6_threshold_20/test/20191209_032500.h5
+model_path: /mnt/gpuserver-1-disk0-nfs/chensiyu/github/Nowcasting/runs/2026-08-30-skillfull-nowcast-seq12-out6-size256-time2-space3/12
+infer_file: /mnt/share-gpuserver-0-disk2-nfs/datasets/depth_estimation_S/data_mining/seq_12_out-seq_6_threshold_20/test/20190929_050000.h5
 decode: expectation
 save_result: true
 show_result: true
-save_path: /mnt/gpuserver-1-disk0-nfs/chensiyu/github/Nowcasting/runs/2026-08-23-skillfull-nowcast-seq12-out6-size256-time2-space3/results/20191209_032500.png
+save_path: /mnt/gpuserver-1-disk0-nfs/chensiyu/github/Nowcasting/runs/2026-08-30-skillfull-nowcast-seq12-out6-size256-time2-space3/results/20190929_050000.png

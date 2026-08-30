@@ -34,7 +34,9 @@ runner:
   find_unused_parameters: true   # Skillful/NowcastNet 在 DDP 下常有未参与反传的参数，需开启
   resume: false
   pretrained_weight_path: null
-  evo_loss_weight: 0.5     # evolution 分支 MSE 权重；总损失 = gen_mse + w * evo_mse
+  evo_loss_weight: 1.0     # J_evolution 权重；总损失 = gen_mse + w * J_evolution
+  motion_reg_weight: 0.01  # λ in J_evolution = J_accum + λ J_motion (paper: 1e-2)
+  rain_weight_clip: 24.0   # w(x) = min(clip, 1 + x) for weighted L1 / motion reg
   optimizer:
     type: Adam
     lr: 0.0001

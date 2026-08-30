@@ -158,12 +158,14 @@ def run_skillfull_inference(
     frames: torch.Tensor,
     device: torch.device,
     enable_amp: bool,
-) -> np.ndarray:
-    """Return gen_pred rain maps with shape [forecast_steps, H, W]."""
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return (gen_pred, evo_pred) rain maps, each [forecast_steps, H, W]."""
     model.eval()
     with torch.cuda.amp.autocast(enabled=enable_amp and device.type == "cuda"):
-        gen_pred, _ = model(frames)
-    return gen_pred[0, :, :, :, 0].detach().cpu().numpy().astype(np.float32)
+        gen_pred, evo_pred, *_ = model(frames)
+    gen = gen_pred[0, :, :, :, 0].detach().cpu().numpy().astype(np.float32)
+    evo = evo_pred[0, :, :, :, 0].detach().cpu().numpy().astype(np.float32)
+    return gen, evo
 
 
 def _shared_vmax(*arrays: Optional[np.ndarray], percentile: float = 99.0) -> float:
@@ -183,6 +185,32 @@ def _shared_vmax(*arrays: Optional[np.ndarray], percentile: float = 99.0) -> flo
     return vmax
 
 
+def _plot_row(
+    axes_row,
+    frames: np.ndarray,
+    label: str,
+    norm: Normalize,
+    cmap: str,
+    titles: Optional[Sequence[str]] = None,
+) -> None:
+    for c in range(frames.shape[0]):
+        ax = axes_row[c]
+        ax.imshow(frames[c], cmap=cmap, norm=norm, origin="upper")
+        if titles is not None:
+            ax.set_title(titles[c], fontsize=8)
+        ax.axis("off")
+    axes_row[0].text(
+        -0.08,
+        0.5,
+        label,
+        transform=axes_row[0].transAxes,
+        va="center",
+        ha="right",
+        fontsize=10,
+        rotation=90,
+    )
+
+
 def visualize(
     future: Optional[np.ndarray],
     pred: np.ndarray,
@@ -190,15 +218,27 @@ def visualize(
     seq_len: int,
     save_path: Optional[str],
     show: bool,
+    evo: Optional[np.ndarray] = None,
+    model_name: str = "nowcast",
     cmap: str = "turbo",
     dpi: int = 140,
 ) -> None:
-    forecast_steps = pred.shape[0]
-    has_gt = future is not None
-    nrows = 2 if has_gt else 1
-    ncols = forecast_steps
+    """Plot forecast panels.
 
-    vmax = _shared_vmax(future, pred)
+    Rows (when available): GT, Evo, Gen/Pred.
+    ``evo`` is only used for SkillfullNowcasting.
+    """
+    forecast_steps = pred.shape[0]
+    rows = []
+    if future is not None:
+        rows.append(("GT", future))
+    if evo is not None:
+        rows.append(("Evo", evo))
+    rows.append(("Gen" if evo is not None else "Pred", pred))
+
+    nrows = len(rows)
+    ncols = forecast_steps
+    vmax = _shared_vmax(*(arr for _, arr in rows))
     norm = Normalize(vmin=0.0, vmax=vmax)
 
     fig, axes = plt.subplots(
@@ -209,42 +249,17 @@ def visualize(
         constrained_layout=True,
     )
 
-    row = 0
-    if has_gt:
-        for c in range(ncols):
-            ax = axes[row][c]
-            ax.imshow(future[c], cmap=cmap, norm=norm, origin="upper")
-            ts_idx = seq_len + c
-            title = timestamps[ts_idx] if ts_idx < len(timestamps) else f"+{c + 1}"
-            ax.set_title(title, fontsize=8)
-            ax.axis("off")
-        axes[row][0].text(
-            -0.08,
-            0.5,
-            "GT",
-            transform=axes[row][0].transAxes,
-            va="center",
-            ha="right",
-            fontsize=10,
-            rotation=90,
-        )
-        row += 1
-
-    for c in range(ncols):
-        ax = axes[row][c]
-        ax.imshow(pred[c], cmap=cmap, norm=norm, origin="upper")
-        ax.set_title(f"+{c + 1}", fontsize=8)
-        ax.axis("off")
-    axes[row][0].text(
-        -0.08,
-        0.5,
-        "Pred",
-        transform=axes[row][0].transAxes,
-        va="center",
-        ha="right",
-        fontsize=10,
-        rotation=90,
-    )
+    for r, (label, frames) in enumerate(rows):
+        if r == 0 and label == "GT":
+            titles = []
+            for c in range(ncols):
+                ts_idx = seq_len + c
+                titles.append(
+                    timestamps[ts_idx] if ts_idx < len(timestamps) else f"+{c + 1}"
+                )
+        else:
+            titles = [f"+{c + 1}" for c in range(ncols)]
+        _plot_row(axes[r], frames, label, norm, cmap, titles=titles)
 
     fig.colorbar(
         plt.cm.ScalarMappable(norm=norm, cmap=cmap),
@@ -254,7 +269,7 @@ def visualize(
         label="precip",
     )
     fig.suptitle(
-        f"MetNet nowcast | pred={pred.shape[1:]} steps={forecast_steps} vmax={vmax:.3g}",
+        f"{model_name} | pred={pred.shape[1:]} steps={forecast_steps} vmax={vmax:.3g}",
         fontsize=12,
     )
 
@@ -369,6 +384,7 @@ def main():
         norm=norm,
     )
 
+    evo_vis = None
     if model_type == "SkillfullNowcasting":
         if decode != "expectation":
             logger.info(f"decode={decode} ignored for SkillfullNowcasting (regression output)")
@@ -379,13 +395,16 @@ def main():
         full_seq = np.concatenate([history_full, future_full], axis=0)
         frames = torch.from_numpy(full_seq.astype(np.float32)).unsqueeze(0).unsqueeze(-1).to(device)
         logger.info(f"frames shape={tuple(frames.shape)}")
-        pred = run_skillfull_inference(
+        pred, evo_vis = run_skillfull_inference(
             model,
             frames,
             device=device,
             enable_amp=not args.no_amp,
         )
         future_vis = future_full
+        logger.info(
+            f"evo shape={evo_vis.shape}, range=[{evo_vis.min():.4g}, {evo_vis.max():.4g}]"
+        )
     elif model_type == "MetNet":
         # Match training crop: history -> input_size, future -> input_size // 4
         if future_full is not None:
@@ -428,10 +447,12 @@ def main():
     visualize(
         future=future_vis,
         pred=pred,
+        evo=evo_vis,
         timestamps=timestamps,
         seq_len=seq_len,
         save_path=save_path,
         show=show_result,
+        model_name=model_type,
         cmap=args.cmap,
     )
 

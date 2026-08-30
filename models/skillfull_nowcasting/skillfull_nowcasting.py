@@ -19,9 +19,11 @@ class SkillfullNowcasting(nn.Module):
     """NowcastNet-style skilful nowcasting generator.
 
     Input:  all_frames [B, T, H, W, C], T = input_length + pred_length
-    Output: (gen_pred, evo_pred)
-            gen_pred [B, pred_length, H, W, 1]
-            evo_pred [B, pred_length, H, W, 1]  (before evo_div scaling)
+    Output: (gen_pred, evo_pred, evo_bili, motion)
+            gen_pred  [B, pred_length, H, W, 1]
+            evo_pred  [B, pred_length, H, W, 1]  nearest-advected + intensity (x'')
+            evo_bili  [B, pred_length, H, W, 1]  bilinear advection only (x'_bili)
+            motion    [B, pred_length, 2, H, W]
     """
 
     def __init__(
@@ -78,7 +80,9 @@ class SkillfullNowcasting(nn.Module):
         sample_tensor = torch.zeros(1, 1, self.img_height, self.img_width)
         self.register_buffer("grid", make_grid(sample_tensor), persistent=False)
 
-    def forward(self, all_frames: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, all_frames: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # Keep only the first channel: [B, T, H, W, 1]
         all_frames = all_frames[:, :, :, :, :1]
         frames = all_frames.permute(0, 1, 4, 2, 3).contiguous()
@@ -95,23 +99,40 @@ class SkillfullNowcasting(nn.Module):
         intensity_ = intensity.reshape(batch, self.pred_length, 1, height, width)
 
         series = []
+        series_bili = []
         last_frames = all_frames[
             :, (self.input_length - 1) : self.input_length, :, :, 0
         ]
         grid = self.grid.repeat(batch, 1, 1, 1)
         for i in range(self.pred_length):
-            last_frames = warp(
+            # Bilinear path: differentiable w.r.t. motion (for accumulation loss).
+            warped_bili = warp(
+                last_frames,
+                motion_[:, i],
+                grid,
+                mode="bilinear",
+                padding_mode="border",
+            )
+            series_bili.append(warped_bili)
+
+            # Nearest path: sharp evolution field x'' = warp_near(x'', v) + s.
+            warped_near = warp(
                 last_frames,
                 motion_[:, i],
                 grid,
                 mode="nearest",
                 padding_mode="border",
             )
-            last_frames = last_frames + intensity_[:, i]
+            last_frames = warped_near + intensity_[:, i]
             series.append(last_frames)
-        evo_result = torch.cat(series, dim=1)
+            # Stop gradient across time steps (paper evolution operator).
+            last_frames = last_frames.detach()
 
-        evo_for_gen = evo_result / self.evo_div
+        evo_result = torch.cat(series, dim=1)
+        evo_bili = torch.cat(series_bili, dim=1)
+
+        # Detach so generator loss does not backprop into evolution net.
+        evo_for_gen = evo_result.detach() / self.evo_div
 
         evo_feature = self.gen_enc(torch.cat([input_frames, evo_for_gen], dim=1))
 
@@ -130,4 +151,5 @@ class SkillfullNowcasting(nn.Module):
 
         gen_pred = gen_result.unsqueeze(-1)
         evo_pred = evo_result.unsqueeze(-1)
-        return gen_pred, evo_pred
+        evo_bili_pred = evo_bili.unsqueeze(-1)
+        return gen_pred, evo_pred, evo_bili_pred, motion_
