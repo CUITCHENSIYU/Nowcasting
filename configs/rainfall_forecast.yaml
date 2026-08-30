@@ -1,24 +1,26 @@
 dataset:
-  type: SyntheticNowcastDataset
-  seq_len: 16
-  forecast_steps: 96
+  type: NimrodDataset
+  seq_len: 12
+  forecast_steps: 6
   input_size: 256
-  num_bins: 512
-  bin_size: 0.2
+  num_bins: 250
+  bin_size: 0.1
+  scale: 47.83
   train:
-    length: 256
+    path: /mnt/share-gpuserver-0-disk2-nfs/datasets/depth_estimation_S/data_mining/seq_12_out-seq_6_threshold_20/train
   val:
-    length: 32
+    path: /mnt/share-gpuserver-0-disk2-nfs/datasets/depth_estimation_S/data_mining/seq_12_out-seq_6_threshold_20/test
 
 model:
   type: MetNet
   input_channels: 1
-  output_channels: 512
+  output_channels: 250
   hidden_dim: 1024
-  forecast_steps: 96
+  forecast_steps: 6
+  # Spatial size AFTER DownSampler (dataset input_size / 4). 256 -> 64.
   input_size: 64
-  num_layers: 1
-  num_att_layers: 2
+  num_layers: 2 # 卷积GRU层数
+  num_att_layers: 3 # 轴注意力层数
   num_att_heads: 16
   low_mem: true
 
@@ -28,33 +30,19 @@ criterion:
 
 runner:
   type: MetNetTrainer
-  batch_size: 1
+  batch_size: 6
   num_workers: 4
-  max_epochs: 2
-  val_interval: 1
+  max_epochs: 50
+  val_interval: 5
   enable_amp: true
-  forecast_steps_train: 4
-  forecast_steps_val: 4
-  log_interval: 5
+  forecast_steps_train: 6
+  forecast_steps_val: 6
+  log_interval: 20
   find_unused_parameters: false
   resume: false
-  pretrained_weight_path: null
+  pretrained_weight_path: ""
   optimizer:
     type: AdamW
     lr: 0.0001
     weight_decay: 0.01
     params: {}
-
-# 使用真实 NIMROD 数据时，替换 dataset 为：
-# dataset:
-#   type: NimrodDataset
-#   path: /path/to/data.jsonl
-#   seq_len: 16
-#   forecast_steps: 96
-#   input_size: 256
-#   num_bins: 512
-#   bin_size: 0.2
-#   train:
-#     path: /path/to/train.jsonl
-#   val:
-#     path: /path/to/val.jsonl

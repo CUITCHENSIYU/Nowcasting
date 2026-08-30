@@ -1,21 +1,14 @@
 import os
-import random
 import time
-from contextlib import nullcontext
 from typing import Optional
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from utils.builder import (
-    build_criterion,
-    build_dataloader,
-    build_model,
-    build_optimizer,
-    build_scheduler,
-)
+from utils.builder import build_dataloader, build_model, build_optimizer, build_scheduler
 from utils.checkpoint import process_checkpoint
 from utils.logger import get_logger
 from utils.misc import is_distributed, is_main_process
@@ -23,26 +16,32 @@ from utils.registry import register_module
 
 
 @register_module(parent="runners")
-class MetNetTrainer:
+class SkillfullTrainer:
+    """Supervised trainer for Skillful Nowcasting (generator + evolution MSE).
+
+    Full adversarial (GAN) training is not included yet; this matches the
+    PredRNN-style single-optimizer loop for getting a runnable baseline.
+    """
+
     def __init__(
         self,
         dataset: dict,
         model: dict,
-        criterion: dict,
         workspace: str,
-        batch_size: int = 1,
+        criterion: Optional[dict] = None,
+        batch_size: int = 2,
         num_workers: int = 4,
-        max_epochs: int = 10,
-        val_interval: int = 1,
-        enable_amp: bool = True,
-        forecast_steps_train: int = 4,
-        forecast_steps_val: Optional[int] = None,
-        log_interval: int = 10,
+        max_epochs: int = 50,
+        val_interval: int = 5,
+        enable_amp: bool = False,
+        log_interval: int = 20,
+        with_mask: bool = False,
         pretrained_weight_path: Optional[str] = None,
         resume: bool = False,
         find_unused_parameters: bool = False,
         optimizer: Optional[dict] = None,
         scheduler: Optional[dict] = None,
+        evo_loss_weight: float = 0.5,
         log_file: str = "training.log",
         local_rank: int = 0,
         world_size: int = 1,
@@ -54,25 +53,39 @@ class MetNetTrainer:
 
         os.makedirs(self.workspace, exist_ok=True)
         log_file = os.path.join(self.workspace, log_file)
-        self.logger = get_logger("metnet", log_file=log_file) if is_main_process() else None
+        self.logger = (
+            get_logger("skillfull", log_file=log_file) if is_main_process() else None
+        )
         self.tensorboard = SummaryWriter(self.workspace) if is_main_process() else None
 
-        self.device = torch.device(f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(
+            f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu"
+        )
         torch.backends.cudnn.benchmark = True
 
         self.batch_size = batch_size
         self.max_epochs = max_epochs
         self.val_interval = val_interval
         self.enable_amp = enable_amp and torch.cuda.is_available()
-        self.forecast_steps_train = forecast_steps_train
-        self.forecast_steps_val = forecast_steps_val or forecast_steps_train
         self.log_interval = log_interval
+        self.with_mask = with_mask
+        self.evo_loss_weight = float(evo_loss_weight)
         self.global_step = 0
         self.epoch = 0
 
         dataset_cfg = dataset
-        model_cfg = model
-        criterion_cfg = criterion
+        model_cfg = model.copy()
+
+        self.seq_len = int(dataset_cfg["seq_len"])
+        self.forecast_steps = int(dataset_cfg["forecast_steps"])
+        self.total_length = self.seq_len + self.forecast_steps
+        img_size = int(dataset_cfg.get("input_size", 256))
+
+        model_cfg.setdefault("input_length", self.seq_len)
+        model_cfg.setdefault("pred_length", self.forecast_steps)
+        model_cfg.setdefault("total_length", self.total_length)
+        model_cfg.setdefault("img_height", img_size)
+        model_cfg.setdefault("img_width", img_size)
 
         self.train_dataloader: DataLoader = build_dataloader(
             dataset_cfg,
@@ -89,19 +102,26 @@ class MetNetTrainer:
                 split="val",
             )
 
-        self.model_cfg = model_cfg
-        self.forecast_steps = model_cfg.get("forecast_steps", 96)
         if resume and not pretrained_weight_path:
             raise ValueError("resume=True requires pretrained_weight_path to a checkpoint")
+
+        # NowcastNet-style generator often has parameters not used in every forward
+        # (spectral-norm hooks, dual evo/gen branches). DDP needs this enabled.
+        ddp_find_unused = find_unused_parameters
+        if is_distributed() and not find_unused_parameters:
+            ddp_find_unused = True
+            if self.logger:
+                self.logger.info(
+                    "DDP: auto-enabled find_unused_parameters=True for SkillfulNowcasting"
+                )
 
         self.model = build_model(
             model_cfg,
             device=self.device,
             logger=self.logger,
             pretrained_weight_path=pretrained_weight_path,
-            find_unused_parameters=find_unused_parameters,
+            find_unused_parameters=ddp_find_unused,
         )
-        self.criterion = build_criterion(criterion_cfg)
         self.optimizer = build_optimizer(optimizer, self.model)
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.enable_amp)
         self.scheduler = None
@@ -129,63 +149,23 @@ class MetNetTrainer:
         if is_distributed():
             self.train_dataloader.sampler.set_epoch(epoch)
 
-    def _unwrap_model(self):
-        model = self.model
-        if hasattr(model, "module"):
-            model = model.module
-        return model
+    def _mse_loss(self, pred: torch.Tensor, target: torch.Tensor, with_mask: bool = False) -> torch.Tensor:
+        """MSE averaged only over target pixels where value != 0 when with_mask=True."""
+        sq_err = (pred - target).pow(2)
+        if not with_mask:
+            return sq_err.mean()
+        mask = target.ne(0)
+        if not mask.any():
+            return sq_err.mean()
+        return sq_err.masked_select(mask).mean()
 
-    def _sample_lead_times(self, count: int):
-        count = min(count, self.forecast_steps)
-        return random.sample(range(self.forecast_steps), k=count)
-
-    def _forward_lead_times(self, inputs, targets, lead_times, backward: bool):
-        total_loss = 0.0
-        loss_dict = {}
-        num_lead_times = len(lead_times)
-
-        if backward:
-            self.optimizer.zero_grad(set_to_none=True)
-
-        # Backward one lead time at a time to keep peak memory low.
-        # Under DDP, sync gradients only on the last lead time.
-        for i, lead_time in enumerate(lead_times):
-            target_t = targets[:, lead_time]
-            use_no_sync = (
-                backward
-                and i < num_lead_times - 1
-                and is_distributed()
-                and hasattr(self.model, "no_sync")
-            )
-            sync_ctx = self.model.no_sync() if use_no_sync else nullcontext()
-
-            with sync_ctx:
-                with torch.cuda.amp.autocast(enabled=self.enable_amp):
-                    pred = self.model(inputs, lead_time=lead_time)
-                    loss = self.criterion(pred, target_t) / num_lead_times
-
-                if not torch.isfinite(loss):
-                    raise RuntimeError(
-                        f"non-finite loss at lead_time={lead_time}: {loss.item()}"
-                    )
-
-                if backward:
-                    self.scaler.scale(loss).backward()
-
-            total_loss += float(loss.detach().item())
-            loss_dict[f"lead_{lead_time}"] = float(loss.detach().item())
-            del pred, loss
-
-        if backward:
-            self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-            if self.scheduler is not None:
-                self.scheduler.step()
-
-        loss_dict["total"] = total_loss
-        return total_loss, loss_dict
+    def _compute_loss(self, frames: torch.Tensor, with_mask: bool = False):
+        gen_pred, evo_pred = self.model(frames)
+        target = frames[:, self.seq_len : self.seq_len + self.forecast_steps]
+        gen_loss = self._mse_loss(gen_pred, target, with_mask)
+        evo_loss = self._mse_loss(evo_pred, target, with_mask)
+        loss = gen_loss + self.evo_loss_weight * evo_loss
+        return loss, float(gen_loss.detach()), float(evo_loss.detach())
 
     def train_epoch(self, epoch: int):
         self.model.train()
@@ -195,14 +175,25 @@ class MetNetTrainer:
         start_time = time.time()
 
         for batch_idx, batch in enumerate(self.train_dataloader):
-            inputs = batch["inputs"].to(self.device, non_blocking=True)
-            targets = batch["targets"].to(self.device, non_blocking=True)
-            lead_times = self._sample_lead_times(self.forecast_steps_train)
+            frames = batch["frames"].to(self.device, non_blocking=True)
+            self.optimizer.zero_grad(set_to_none=True)
 
-            loss, loss_dict = self._forward_lead_times(
-                inputs, targets, lead_times, backward=True
-            )
-            epoch_loss += loss
+            with torch.cuda.amp.autocast(enabled=self.enable_amp):
+                loss, gen_loss, evo_loss = self._compute_loss(frames, self.with_mask)
+
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"non-finite loss: {loss.item()}")
+
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            if self.scheduler is not None:
+                self.scheduler.step()
+
+            loss_val = float(loss.detach().item())
+            epoch_loss += loss_val
             num_batches += 1
             self.global_step += 1
 
@@ -212,10 +203,15 @@ class MetNetTrainer:
                     self.logger.info(
                         f"Epoch [{epoch + 1}/{self.max_epochs}] "
                         f"Iter [{batch_idx + 1}/{len(self.train_dataloader)}] "
-                        f"loss={loss:.4f} time={elapsed:.1f}s"
+                        f"loss={loss_val:.6f} gen={gen_loss:.6f} evo={evo_loss:.6f} "
+                        f"time={elapsed:.1f}s"
                     )
                 if self.tensorboard:
-                    self.tensorboard.add_scalar("train/loss", loss, self.global_step)
+                    self.tensorboard.add_scalar("train/loss", loss_val, self.global_step)
+                    self.tensorboard.add_scalar("train/gen_loss", gen_loss, self.global_step)
+                    self.tensorboard.add_scalar("train/evo_loss", evo_loss, self.global_step)
+
+            del loss
 
         return epoch_loss / max(num_batches, 1)
 
@@ -227,18 +223,12 @@ class MetNetTrainer:
         self.model.eval()
         total_loss = 0.0
         num_batches = 0
-        lead_times = list(range(min(self.forecast_steps_val, self.forecast_steps)))
 
         for batch in self.val_dataloader:
-            inputs = batch["inputs"].to(self.device, non_blocking=True)
-            targets = batch["targets"].to(self.device, non_blocking=True)
-            batch_loss = 0.0
-            for lead_time in lead_times:
-                target_t = targets[:, lead_time]
-                with torch.cuda.amp.autocast(enabled=self.enable_amp):
-                    pred = self.model(inputs, lead_time=lead_time)
-                    batch_loss += self.criterion(pred, target_t).item()
-            total_loss += batch_loss / len(lead_times)
+            frames = batch["frames"].to(self.device, non_blocking=True)
+            with torch.cuda.amp.autocast(enabled=self.enable_amp):
+                loss, _, _ = self._compute_loss(frames, self.with_mask)
+            total_loss += float(loss.item())
             num_batches += 1
 
         avg_loss = total_loss / max(num_batches, 1)
@@ -254,8 +244,9 @@ class MetNetTrainer:
     def run(self):
         if self.logger:
             self.logger.info(
-                f"Start training: world_size={self.world_size}, "
-                f"batch_size={self.batch_size}, forecast_steps_train={self.forecast_steps_train}"
+                f"Start Skillful Nowcasting training: world_size={self.world_size}, "
+                f"batch_size={self.batch_size}, total_length={self.total_length}, "
+                f"evo_loss_weight={self.evo_loss_weight}"
             )
 
         for epoch in range(self.epoch, self.max_epochs):

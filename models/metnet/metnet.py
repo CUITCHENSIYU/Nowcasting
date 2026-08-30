@@ -86,7 +86,13 @@ class MetNet(torch.nn.Module, PyTorchModelHubMixin):
         x = self.image_encoder(x)
         # Temporal Encoder
         state = self.temporal_enc(self.drop(x))
-        return self.temporal_agg(self.position_embedding(state))
+        # AxialAttention is numerically unstable under fp16 autocast and can
+        # crash autograd with a bare SystemError. Keep this block in fp32.
+        with torch.cuda.amp.autocast(enabled=False):
+            state = state.float()
+            state = self.position_embedding(state)
+            state = self.temporal_agg(state)
+        return state
 
     def forward(self, imgs: torch.Tensor, lead_time: int = 0) -> torch.Tensor:
         """It takes a rank 5 tensor

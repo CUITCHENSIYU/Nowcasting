@@ -49,18 +49,20 @@ def restore_model(
         return
     if logger is not None:
         logger.info(f"[MODEL_RESTORE] Restoring weights from {model_path}")
-    state_dict = torch.load(
+    checkpoint = torch.load(
         model_path, map_location=lambda storage, loc: storage.cpu()
     )
-    if "epoch" in state_dict:
-        logger.info(f"[MODEL_RESTORE] Best epoch: {state_dict['epoch']}")
-    if "state_dict" in state_dict:
-        state_dict = state_dict["state_dict"]
+    if isinstance(checkpoint, dict) and "epoch" in checkpoint and logger is not None:
+        logger.info(f"[MODEL_RESTORE] checkpoint epoch: {checkpoint['epoch']}")
 
-    if "model" in state_dict:
-        state_dict = state_dict["model"]
+    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+        state_dict = checkpoint["state_dict"]
+    elif isinstance(checkpoint, dict) and "model" in checkpoint:
+        state_dict = checkpoint["model"]
+    else:
+        state_dict = checkpoint
 
-    # support pytorch2 format
+    # support pytorch2 / DDP prefixes
     state_dict = {
         k.replace("_orig_mod.module.", "")
         if k.startswith("_orig_mod.module.")
@@ -72,7 +74,9 @@ def restore_model(
         for k, v in state_dict.items()
     }
 
-    _load_state_dict(model, state_dict, verbose, logger)
+    if hasattr(model, "module"):
+        model = model.module
+    _load_state_dict(model, state_dict, verbose=verbose and logger is not None, logger=logger)
 
 
 def process_checkpoint(model, optimizer, workspace, epoch, create_symlink = True):

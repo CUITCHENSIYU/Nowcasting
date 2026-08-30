@@ -1,0 +1,42 @@
+dataset:
+  type: NimrodSkillfullDataset
+  seq_len: 12
+  forecast_steps: 6
+  input_size: 256          # 必须能被 32 整除（噪声投影 reshape 约束）
+  scale: 47.83
+  norm: 1.0
+  img_channel: 1
+  train:
+    path: /mnt/share-gpuserver-0-disk2-nfs/datasets/depth_estimation_S/data_mining/seq_12_out-seq_6_threshold_20/train
+  val:
+    path: /mnt/share-gpuserver-0-disk2-nfs/datasets/depth_estimation_S/data_mining/seq_12_out-seq_6_threshold_20/test
+
+model:
+  type: SkillfullNowcasting
+  input_length: 12         # 历史帧数，需与 dataset.seq_len 一致
+  pred_length: 6           # 预报步数，需与 dataset.forecast_steps 一致
+  img_height: 256          # 需与 dataset.input_size 一致
+  img_width: 256
+  ngf: 32                  # 生成网络基础通道数
+  evo_base_c: 32           # Evolution U-Net 基础通道数
+  evo_div: 1.0             # evolution 结果送入生成器前的除数（原论文反射率尺度常用 128）
+  # ic_feature: 320        # 默认 ngf*10，一般无需手动设置
+
+runner:
+  type: SkillfullTrainer
+  batch_size: 12
+  num_workers: 4
+  max_epochs: 50
+  val_interval: 5
+  enable_amp: false
+  log_interval: 20
+  with_mask: false
+  find_unused_parameters: true   # Skillful/NowcastNet 在 DDP 下常有未参与反传的参数，需开启
+  resume: false
+  pretrained_weight_path: null
+  evo_loss_weight: 0.5     # evolution 分支 MSE 权重；总损失 = gen_mse + w * evo_mse
+  optimizer:
+    type: Adam
+    lr: 0.0001
+    weight_decay: 0.0
+    params: {}

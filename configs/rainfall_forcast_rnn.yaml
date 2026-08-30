@@ -1,0 +1,48 @@
+dataset:
+  type: NimrodRNNDataset
+  seq_len: 12
+  forecast_steps: 6
+  input_size: 64
+  scale: 47.83
+  norm: 47.83
+  img_channel: 1
+  train:
+    path: /mnt/share-gpuserver-0-disk2-nfs/datasets/depth_estimation_S/data_mining/seq_12_out-seq_6_threshold_20/train
+  val:
+    path: /mnt/share-gpuserver-0-disk2-nfs/datasets/depth_estimation_S/data_mining/seq_12_out-seq_6_threshold_20/test
+
+model:
+  type: PredRNN
+  num_layers: 4                      # ST-LSTM 堆叠层数
+  num_hidden: [128, 128, 128, 128]   # 每层隐状态通道数，长度需等于 num_layers
+  img_channel: 1                     # 输入图像通道数（雷达为单通道）
+  img_size: 64                       # 输入空间尺寸，需与 dataset.input_size 一致
+  patch_size: 4                      # patch 划分大小；特征图变为 img_size/patch_size，通道变为 C*patch_size^2
+  filter_size: 5                     # ST-LSTM 卷积核大小
+  stride: 1                          # ST-LSTM 卷积步长
+  layer_norm: true                   # 是否在 ST-LSTM 内使用 LayerNorm
+  decouple_beta: 0.1                 # 时空记忆解耦损失权重（PredRNN-V2）
+  conv_on_input: 0                   # 1=输入先下采样卷积再进 RNN；0=直接在 patch 特征上跑 RNN
+  res_on_conv: 0                     # 仅 conv_on_input=1 时生效：解码时是否加残差
+  total_length: 18                   # 总序列长度 = seq_len + forecast_steps
+
+runner:
+  type: RNNTrainer
+  batch_size: 4
+  num_workers: 4
+  max_epochs: 50
+  val_interval: 5
+  enable_amp: false
+  log_interval: 20
+  find_unused_parameters: false
+  resume: false
+  pretrained_weight_path: null
+  scheduled_sampling: true
+  sampling_stop_iter: 50000
+  sampling_changing_rate: 0.00002
+  eta: 1.0
+  optimizer:
+    type: Adam
+    lr: 0.0003
+    weight_decay: 0.0
+    params: {}

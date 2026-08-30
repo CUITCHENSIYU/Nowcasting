@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.optim as optim
 
 from utils.registry import get_module
-from utils.misc import is_main_process, is_distributed, get_world_size
+from utils.misc import is_distributed
 from utils.checkpoint import restore_model
 
 
@@ -120,19 +120,18 @@ def build_model(
         model_cfg, parent="models", default_args=default_args
     )
     model = model.to(device)
-    if is_main_process() and pretrained_weight_path is not None:
+    # Load on every rank so DDP workers start from the same weights.
+    if pretrained_weight_path is not None:
         restore_model(model, pretrained_weight_path, logger=logger)
 
     if is_distributed():
-        process_group = torch.distributed.new_group(range(get_world_size()))
-        model = nn.SyncBatchNorm.convert_sync_batchnorm(
-            model, process_group=process_group
-        )
+        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
         model = nn.parallel.DistributedDataParallel(
             model,
             device_ids=[device.index] if device.index is not None else None,
             output_device=device.index,
             find_unused_parameters=find_unused_parameters,
+            broadcast_buffers=False,
         )
     return model
 

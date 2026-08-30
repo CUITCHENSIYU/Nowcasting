@@ -216,13 +216,10 @@ class ConvGRU(nn.Module):
 
             h = hidden_state[l]
             output_inner = [] if return_sequence else None
+            # Per-timestep checkpoint reuses the same cell params and is unsafe
+            # with DDP / AMP (ready-twice / bare SystemError in backward).
             for inp_t in steps:
-                if self.use_checkpoint and self.training:
-                    h = torch.utils.checkpoint.checkpoint(
-                        lambda i, hp, cell=gru_cell: cell(input=i, h_prev=hp), inp_t, h
-                    )
-                else:
-                    h = gru_cell(input=inp_t, h_prev=h)
+                h = gru_cell(input=inp_t, h_prev=h)
                 if return_sequence:
                     output_inner.append(h)
 

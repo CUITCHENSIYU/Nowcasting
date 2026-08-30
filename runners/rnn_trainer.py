@@ -1,21 +1,15 @@
 import os
-import random
 import time
-from contextlib import nullcontext
 from typing import Optional
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from utils.builder import (
-    build_criterion,
-    build_dataloader,
-    build_model,
-    build_optimizer,
-    build_scheduler,
-)
+from models.predrnn.rnn import reshape_patch
+from utils.builder import build_dataloader, build_model, build_optimizer, build_scheduler
 from utils.checkpoint import process_checkpoint
 from utils.logger import get_logger
 from utils.misc import is_distributed, is_main_process
@@ -23,26 +17,31 @@ from utils.registry import register_module
 
 
 @register_module(parent="runners")
-class MetNetTrainer:
+class RNNTrainer:
+    """Trainer for PredRNN radar nowcasting with scheduled sampling."""
+
     def __init__(
         self,
         dataset: dict,
         model: dict,
-        criterion: dict,
         workspace: str,
-        batch_size: int = 1,
+        criterion: Optional[dict] = None,
+        batch_size: int = 4,
         num_workers: int = 4,
-        max_epochs: int = 10,
-        val_interval: int = 1,
-        enable_amp: bool = True,
-        forecast_steps_train: int = 4,
-        forecast_steps_val: Optional[int] = None,
-        log_interval: int = 10,
+        max_epochs: int = 50,
+        val_interval: int = 5,
+        enable_amp: bool = False,
+        log_interval: int = 20,
         pretrained_weight_path: Optional[str] = None,
         resume: bool = False,
         find_unused_parameters: bool = False,
         optimizer: Optional[dict] = None,
         scheduler: Optional[dict] = None,
+        # scheduled sampling
+        scheduled_sampling: bool = True,
+        sampling_stop_iter: int = 50000,
+        sampling_changing_rate: float = 0.00002,
+        eta: float = 1.0,
         log_file: str = "training.log",
         local_rank: int = 0,
         world_size: int = 1,
@@ -54,25 +53,41 @@ class MetNetTrainer:
 
         os.makedirs(self.workspace, exist_ok=True)
         log_file = os.path.join(self.workspace, log_file)
-        self.logger = get_logger("metnet", log_file=log_file) if is_main_process() else None
+        self.logger = get_logger("predrnn", log_file=log_file) if is_main_process() else None
         self.tensorboard = SummaryWriter(self.workspace) if is_main_process() else None
 
-        self.device = torch.device(f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(
+            f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu"
+        )
         torch.backends.cudnn.benchmark = True
 
         self.batch_size = batch_size
         self.max_epochs = max_epochs
         self.val_interval = val_interval
+        # PredRNN ST-LSTM + LayerNorm is safer in fp32 by default.
         self.enable_amp = enable_amp and torch.cuda.is_available()
-        self.forecast_steps_train = forecast_steps_train
-        self.forecast_steps_val = forecast_steps_val or forecast_steps_train
         self.log_interval = log_interval
         self.global_step = 0
         self.epoch = 0
 
+        self.scheduled_sampling = scheduled_sampling
+        self.sampling_stop_iter = sampling_stop_iter
+        self.sampling_changing_rate = sampling_changing_rate
+        self.eta = float(eta)
+
         dataset_cfg = dataset
         model_cfg = model
-        criterion_cfg = criterion
+
+        self.seq_len = int(dataset_cfg["seq_len"])
+        self.forecast_steps = int(dataset_cfg["forecast_steps"])
+        self.total_length = self.seq_len + self.forecast_steps
+        self.patch_size = int(model_cfg.get("patch_size", 4))
+        self.img_channel = int(model_cfg.get("img_channel", 1))
+        self.img_size = int(model_cfg.get("img_size", dataset_cfg.get("input_size", 64)))
+
+        model_cfg = model_cfg.copy()
+        model_cfg.setdefault("total_length", self.total_length)
+        model_cfg.setdefault("img_size", self.img_size)
 
         self.train_dataloader: DataLoader = build_dataloader(
             dataset_cfg,
@@ -89,8 +104,6 @@ class MetNetTrainer:
                 split="val",
             )
 
-        self.model_cfg = model_cfg
-        self.forecast_steps = model_cfg.get("forecast_steps", 96)
         if resume and not pretrained_weight_path:
             raise ValueError("resume=True requires pretrained_weight_path to a checkpoint")
 
@@ -101,7 +114,6 @@ class MetNetTrainer:
             pretrained_weight_path=pretrained_weight_path,
             find_unused_parameters=find_unused_parameters,
         )
-        self.criterion = build_criterion(criterion_cfg)
         self.optimizer = build_optimizer(optimizer, self.model)
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.enable_amp)
         self.scheduler = None
@@ -135,57 +147,50 @@ class MetNetTrainer:
             model = model.module
         return model
 
-    def _sample_lead_times(self, count: int):
-        count = min(count, self.forecast_steps)
-        return random.sample(range(self.forecast_steps), k=count)
+    def _schedule_sampling(self, batch_size: int, train: bool) -> torch.Tensor:
+        """Build mask_true in patch space: [B, T-1, H, W, C]."""
+        patch_h = self.img_size // self.patch_size
+        patch_w = self.img_size // self.patch_size
+        patch_ch = self.img_channel * (self.patch_size ** 2)
 
-    def _forward_lead_times(self, inputs, targets, lead_times, backward: bool):
-        total_loss = 0.0
-        loss_dict = {}
-        num_lead_times = len(lead_times)
+        context_masks = self.seq_len - 1
+        forecast_masks = self.total_length - self.seq_len
+        # (seq_len-1) + forecast_steps = total_length-1
 
-        if backward:
-            self.optimizer.zero_grad(set_to_none=True)
+        ones = np.ones(
+            (batch_size, context_masks, patch_h, patch_w, patch_ch), dtype=np.float32
+        )
 
-        # Backward one lead time at a time to keep peak memory low.
-        # Under DDP, sync gradients only on the last lead time.
-        for i, lead_time in enumerate(lead_times):
-            target_t = targets[:, lead_time]
-            use_no_sync = (
-                backward
-                and i < num_lead_times - 1
-                and is_distributed()
-                and hasattr(self.model, "no_sync")
+        if (not train) or (not self.scheduled_sampling):
+            zeros = np.zeros(
+                (batch_size, forecast_masks, patch_h, patch_w, patch_ch),
+                dtype=np.float32,
             )
-            sync_ctx = self.model.no_sync() if use_no_sync else nullcontext()
+            mask = np.concatenate([ones, zeros], axis=1)
+            return torch.from_numpy(mask)
 
-            with sync_ctx:
-                with torch.cuda.amp.autocast(enabled=self.enable_amp):
-                    pred = self.model(inputs, lead_time=lead_time)
-                    loss = self.criterion(pred, target_t) / num_lead_times
+        if self.global_step < self.sampling_stop_iter:
+            self.eta = max(self.eta - self.sampling_changing_rate, 0.0)
+        else:
+            self.eta = 0.0
 
-                if not torch.isfinite(loss):
-                    raise RuntimeError(
-                        f"non-finite loss at lead_time={lead_time}: {loss.item()}"
-                    )
+        random_flip = np.random.random_sample(
+            (batch_size, forecast_masks, patch_h, patch_w, patch_ch)
+        )
+        true_token = (random_flip < self.eta).astype(np.float32)
+        mask = np.concatenate([ones, true_token], axis=1)
+        return torch.from_numpy(mask)
 
-                if backward:
-                    self.scaler.scale(loss).backward()
+    def _forward_batch(self, frames: torch.Tensor, train: bool):
+        batch_size = frames.shape[0]
+        frames_patch = reshape_patch(frames, self.patch_size)
+        mask_true = self._schedule_sampling(batch_size, train=train).to(
+            frames.device, non_blocking=True
+        )
 
-            total_loss += float(loss.detach().item())
-            loss_dict[f"lead_{lead_time}"] = float(loss.detach().item())
-            del pred, loss
-
-        if backward:
-            self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-            if self.scheduler is not None:
-                self.scheduler.step()
-
-        loss_dict["total"] = total_loss
-        return total_loss, loss_dict
+        with torch.cuda.amp.autocast(enabled=self.enable_amp):
+            pred_patch, loss = self.model(frames_patch, mask_true)
+        return pred_patch, loss
 
     def train_epoch(self, epoch: int):
         self.model.train()
@@ -195,14 +200,23 @@ class MetNetTrainer:
         start_time = time.time()
 
         for batch_idx, batch in enumerate(self.train_dataloader):
-            inputs = batch["inputs"].to(self.device, non_blocking=True)
-            targets = batch["targets"].to(self.device, non_blocking=True)
-            lead_times = self._sample_lead_times(self.forecast_steps_train)
+            frames = batch["frames"].to(self.device, non_blocking=True)
+            self.optimizer.zero_grad(set_to_none=True)
 
-            loss, loss_dict = self._forward_lead_times(
-                inputs, targets, lead_times, backward=True
-            )
-            epoch_loss += loss
+            pred_patch, loss = self._forward_batch(frames, train=True)
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"non-finite loss: {loss.item()}")
+
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            if self.scheduler is not None:
+                self.scheduler.step()
+
+            loss_val = float(loss.detach().item())
+            epoch_loss += loss_val
             num_batches += 1
             self.global_step += 1
 
@@ -212,10 +226,13 @@ class MetNetTrainer:
                     self.logger.info(
                         f"Epoch [{epoch + 1}/{self.max_epochs}] "
                         f"Iter [{batch_idx + 1}/{len(self.train_dataloader)}] "
-                        f"loss={loss:.4f} time={elapsed:.1f}s"
+                        f"loss={loss_val:.4f} eta={self.eta:.4f} time={elapsed:.1f}s"
                     )
                 if self.tensorboard:
-                    self.tensorboard.add_scalar("train/loss", loss, self.global_step)
+                    self.tensorboard.add_scalar("train/loss", loss_val, self.global_step)
+                    self.tensorboard.add_scalar("train/eta", self.eta, self.global_step)
+
+            del pred_patch, loss
 
         return epoch_loss / max(num_batches, 1)
 
@@ -227,18 +244,11 @@ class MetNetTrainer:
         self.model.eval()
         total_loss = 0.0
         num_batches = 0
-        lead_times = list(range(min(self.forecast_steps_val, self.forecast_steps)))
 
         for batch in self.val_dataloader:
-            inputs = batch["inputs"].to(self.device, non_blocking=True)
-            targets = batch["targets"].to(self.device, non_blocking=True)
-            batch_loss = 0.0
-            for lead_time in lead_times:
-                target_t = targets[:, lead_time]
-                with torch.cuda.amp.autocast(enabled=self.enable_amp):
-                    pred = self.model(inputs, lead_time=lead_time)
-                    batch_loss += self.criterion(pred, target_t).item()
-            total_loss += batch_loss / len(lead_times)
+            frames = batch["frames"].to(self.device, non_blocking=True)
+            _, loss = self._forward_batch(frames, train=False)
+            total_loss += float(loss.item())
             num_batches += 1
 
         avg_loss = total_loss / max(num_batches, 1)
@@ -254,8 +264,9 @@ class MetNetTrainer:
     def run(self):
         if self.logger:
             self.logger.info(
-                f"Start training: world_size={self.world_size}, "
-                f"batch_size={self.batch_size}, forecast_steps_train={self.forecast_steps_train}"
+                f"Start PredRNN training: world_size={self.world_size}, "
+                f"batch_size={self.batch_size}, total_length={self.total_length}, "
+                f"img_size={self.img_size}, patch_size={self.patch_size}"
             )
 
         for epoch in range(self.epoch, self.max_epochs):
